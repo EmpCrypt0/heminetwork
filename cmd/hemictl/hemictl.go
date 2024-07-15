@@ -460,7 +460,7 @@ func tbcdb() error {
 		var revTxId [32]byte
 		copy(revTxId[:], chtxid[:])
 
-		bh, err := s.DB().BlocksByTxId(ctx, revTxId)
+		bh, err := s.DB().BlocksByTxId(ctx, revTxId[:])
 		if err != nil {
 			return fmt.Errorf("block by txid: %w", err)
 		}
