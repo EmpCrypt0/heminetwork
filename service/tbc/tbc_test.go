@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/hemilabs/heminetwork/database/tbcd"
 	"io"
 	"net"
 	"os"
@@ -20,6 +19,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/hemilabs/heminetwork/database/tbcd"
 
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
@@ -1116,8 +1117,10 @@ func hexToHash(hexStr string) (*[32]byte, error) {
 	return &hash, nil
 }
 
-var regtestGenesisHeader = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4adae5494dffff7f2002000000"
-var regtestGenesisHash = "06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f"
+var (
+	regtestGenesisHeader = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4adae5494dffff7f2002000000"
+	regtestGenesisHash   = "06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f"
+)
 
 var simpleChainHeaders = [...]string{
 	"0000002006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f7f8d3254fe4edbe9490e7435863b654877e238842528042a89f26b877deadd0268dd9566ffff7f2000000000", // 1
@@ -1206,7 +1209,6 @@ func getHeaderHashesRange(start int, end int, headerStrs []string, hashStrs []st
 	calculatedHashes := make([]chainhash.Hash, end-start+1)
 	for i := start; i <= end; i++ {
 		raw, parsed, hash, err := getHeaderHashIndex(i, headerStrs, hashStrs)
-
 		if err != nil {
 			return nil, nil, nil, err
 		}
