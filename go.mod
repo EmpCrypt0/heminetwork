@@ -29,6 +29,7 @@ require (
 	github.com/sethvargo/go-retry v0.3.0
 	github.com/syndtr/goleveldb v1.0.1-0.20210819022825-2ae1ddf74ef7
 	github.com/testcontainers/testcontainers-go v0.32.0
+	golang.org/x/exp v0.0.0-20231110203233-9a3e6036ecaa
 	golang.org/x/sys v0.23.0
 )
 
