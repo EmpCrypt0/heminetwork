@@ -2041,7 +2041,7 @@ func (s *Server) ExternalHeaderSetup(ctx context.Context) error {
 			return err
 		}
 	} else { // No error getting best header, no genesis insert, so check db genesis matches
-		gb, err := s.db.BlockHeadersByHeight(ctx, 0)
+		gb, err := s.db.BlockHeadersByHeight(ctx, s.cfg.GenesisHeightOffset)
 		if err != nil {
 			return fmt.Errorf("error getting genesis block from db, %w", err)
 		}
