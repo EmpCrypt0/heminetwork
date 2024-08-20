@@ -928,6 +928,8 @@ func (l *ldb) BlockHeadersInsert(ctx context.Context, bhs [][80]byte, upstreamSt
 	}
 	bestBH := decodeBlockHeader(bbh)
 
+	log.Infof("Best block header in TBC before insertion: %s @ %d", bestBH.BlockHash().String(), bestBH.Height)
+
 	// Fork is set to true if the first blockheader does not connect to the
 	// canonical blockheader.
 	fork := !bytes.Equal(wbh.PrevBlock[:], bestBH.Hash[:])
@@ -962,6 +964,7 @@ func (l *ldb) BlockHeadersInsert(ctx context.Context, bhs [][80]byte, upstreamSt
 
 		// pre set values because we start with previous value
 		height++
+		// XXX Is wbh correct here for multiple headers? What about difficulty adjustment boundary?
 		cdiff = new(big.Int).Add(cdiff, blockchain.CalcWork(wbh.Bits))
 
 		// Store height_hash for future reference
@@ -985,6 +988,8 @@ func (l *ldb) BlockHeadersInsert(ctx context.Context, bhs [][80]byte, upstreamSt
 		lastRecord = ebh[:]
 	}
 
+	lrh := decodeBlockHeader(lastRecord)
+
 	cbh := &tbcd.BlockHeader{
 		Hash:       &bhash,
 		Height:     height,
@@ -999,8 +1004,10 @@ func (l *ldb) BlockHeadersInsert(ctx context.Context, bhs [][80]byte, upstreamSt
 	if fork {
 		// Insert last height into block headers if the new cumulative
 		// difficulty exceeds the prior difficulty.
+		log.Infof("Fork detected, cdiff=%v, bestBH.Difficulty=%v", cdiff, bestBH.Difficulty)
 		switch cdiff.Cmp(&bestBH.Difficulty) {
 		case -1, 0:
+			log.Infof("Fork extended")
 			// Extend fork, fork did not overcome difficulty
 			it = tbcd.ITForkExtend
 
@@ -1010,6 +1017,7 @@ func (l *ldb) BlockHeadersInsert(ctx context.Context, bhs [][80]byte, upstreamSt
 			cbh = bestBH
 
 		case 1:
+			log.Infof("Chain fork, new best chain tip is %s @ %d", lrh.BlockHash().String(), lrh.Height)
 			log.Debugf("(%v) 1: %v > %v", height, cdiff, bestBH.Difficulty)
 			// log.Infof("%v", spew.Sdump(bestBH.Hash[:]))
 			// log.Infof("%v", spew.Sdump(firstHash))
