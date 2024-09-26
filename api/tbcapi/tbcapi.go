@@ -217,6 +217,7 @@ type TxByIdRawRequest struct {
 
 type TxByIdRawResponse struct {
 	Tx    api.ByteSlice   `json:"tx"`
+	Hash  api.ByteSlice   `json:"hash"`
 	Error *protocol.Error `json:"error,omitempty"`
 }
 
@@ -226,6 +227,7 @@ type TxByIdRequest struct {
 
 type TxByIdResponse struct {
 	Tx    *Tx             `json:"tx"`
+	Hash  api.ByteSlice   `json:"hash"`
 	Error *protocol.Error `json:"error,omitempty"`
 }
 
