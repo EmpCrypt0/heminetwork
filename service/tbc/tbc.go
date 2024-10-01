@@ -2261,7 +2261,7 @@ func (s *Server) ExternalHeaderSetup(ctx context.Context) error {
 			return fmt.Errorf("block headers best: %w", err)
 		}
 
-		err := s.db.BlockHeaderGenesisInsert(ctx, &s.chainParams.GenesisBlock.Header, genesisHeight, genesisDiff)
+		err := s.db.BlockHeaderGenesisInsert(ctx, genesis, genesisHeight, genesisDiff)
 		if err != nil {
 			return fmt.Errorf("genesis block header insert: %w", err)
 		}
