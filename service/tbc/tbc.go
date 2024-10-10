@@ -5,6 +5,7 @@
 package tbc
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -102,17 +103,34 @@ type Config struct {
 	PrometheusListenAddress string
 	PprofListenAddress      string
 	Seeds                   []string
+
+	// In header-only mode, P2P is disabled and TBC expects to be fed external
+	// headers by the code that manages it. Additionally, a fake genesis
+	// block can optionally be configured which TBC will build on top of,
+	// with pre-set height and cumulative difficulty adjustments so TBC
+	// can return correct height/cdiff values for blocks in its chain.
+	// This mode was originally created for op-geth to be able to maintain
+	// a lightweight header-only view of Bitcoin consensus based on BTC
+	// Attributes Deposited transactions which communicate new Bitcoin
+	// headers to the protocol and determine what blocks are actually
+	// indexed in op-geth's separate full TBC node at each L2 block to
+	// ensure deterministic Bitcoin state availability to hVM precompiles.
+	ExternalHeaderMode      bool
+	EffectiveGenesisBlock   *wire.BlockHeader
+	GenesisHeightOffset     uint64
+	GenesisDifficultyOffset big.Int
 }
 
 func NewDefaultConfig() *Config {
 	return &Config{
-		ListenAddress:    tbcapi.DefaultListen,
-		BlockCache:       250,
-		BlockheaderCache: 1e6,
-		LogLevel:         logLevel,
-		MaxCachedTxs:     defaultMaxCachedTxs,
-		MempoolEnabled:   true,
-		PeersWanted:      defaultPeersWanted,
+		ListenAddress:      tbcapi.DefaultListen,
+		BlockCache:         250,
+		BlockheaderCache:   1e6,
+		LogLevel:           logLevel,
+		MaxCachedTxs:       defaultMaxCachedTxs,
+		MempoolEnabled:     true,
+		PeersWanted:        defaultPeersWanted,
+		ExternalHeaderMode: false, // Default anyway, but for readability
 	}
 }
 
@@ -168,22 +186,25 @@ func NewServer(cfg *Config) (*Server, error) {
 	if cfg == nil {
 		cfg = NewDefaultConfig()
 	}
-	pings, err := ttl.New(cfg.PeersWanted, true)
-	if err != nil {
-		return nil, err
-	}
-	blocks, err := ttl.New(defaultPendingBlocks, true)
-	if err != nil {
-		return nil, err
+
+	var pings *ttl.TTL
+	var blocks *ttl.TTL
+	var err error
+
+	if !cfg.ExternalHeaderMode {
+		pings, err = ttl.New(cfg.PeersWanted, true)
+		if err != nil {
+			return nil, err
+		}
+		blocks, err = ttl.New(defaultPendingBlocks, true)
+		if err != nil {
+			return nil, err
+		}
 	}
 	defaultRequestTimeout := 10 * time.Second // XXX: make config option?
 	s := &Server{
 		cfg:        cfg,
 		printTime:  time.Now().Add(10 * time.Second),
-		blocks:     blocks,
-		peers:      make(map[string]*peer, cfg.PeersWanted),
-		pm:         newPeerManager(),
-		pings:      pings,
 		timeSource: blockchain.NewMedianTime(),
 		cmdsProcessed: prometheus.NewCounter(prometheus.CounterOpts{
 			Subsystem: promSubsystem,
@@ -200,30 +221,43 @@ func NewServer(cfg *Config) (*Server, error) {
 		}
 	}
 
+	if !cfg.ExternalHeaderMode {
+		s.blocks = blocks
+		s.peers = make(map[string]*peer, cfg.PeersWanted)
+		s.pm = newPeerManager()
+		s.pings = pings
+	}
+
 	// We could use a PGURI verification here.
+
+	var seeds []string
 
 	switch cfg.Network {
 	case "mainnet":
 		s.wireNet = wire.MainNet
 		s.chainParams = &chaincfg.MainNetParams
-		s.seeds = mainnetSeeds
+		seeds = mainnetSeeds
 		s.checkpoints = mainnetCheckpoints
 	case "testnet3":
 		s.wireNet = wire.TestNet3
 		s.chainParams = &chaincfg.TestNet3Params
-		s.seeds = testnetSeeds
+		seeds = testnetSeeds
 		s.checkpoints = testnet3Checkpoints
 	case networkLocalnet:
 		s.wireNet = wire.TestNet
 		s.chainParams = &chaincfg.RegressionNetParams
-		s.seeds = localnetSeeds
+		seeds = localnetSeeds
 		s.checkpoints = make(map[chainhash.Hash]uint64)
 	default:
 		return nil, fmt.Errorf("invalid network: %v", cfg.Network)
 	}
 
-	if len(cfg.Seeds) > 0 {
-		s.seeds = cfg.Seeds
+	if !cfg.ExternalHeaderMode {
+		if len(cfg.Seeds) > 0 {
+			s.seeds = cfg.Seeds
+		} else {
+			s.seeds = seeds
+		}
 	}
 
 	return s, nil
@@ -1333,6 +1367,66 @@ func (s *Server) syncBlocks(ctx context.Context) {
 	}
 }
 
+// RemoveExternalHeaders removes the provided headers from TBC's state knowledge,
+// setting the canonical tip to the provided tip. This method can only be
+// used when TBC is running in external header mode.
+//
+// The upstream state id is an optional identifier that the caller can use to track
+// some upstream state which represents TBC's own state once this removal is
+// performed. For example, op-geth uses this to track the hash of the EVM block
+// which cumulatively represents TBC's entire header knowledge after the removal
+// is processed, such that re-applying all Bitcoin Attributes Deposited transactions
+// in the EVM from genesis to that hash would result in TBC having this state.
+//
+// This upstream state id is tracked in TBC rather than upstream in the caller so
+// that updates to the upstreamCursor are always made atomically with the
+// corresponding TBC database state transition. Otherwise, an unexpected termination
+// between updating TBC state and recording the updated upstreamCursor could cause
+// state corruption.
+func (s *Server) RemoveExternalHeaders(ctx context.Context, headers *wire.MsgHeaders, tipAfterRemoval *wire.BlockHeader, upstreamStateId *[32]byte) (tbcd.RemoveType, *tbcd.BlockHeader, error) {
+	if !s.cfg.ExternalHeaderMode {
+		return tbcd.RTInvalid, nil,
+			errors.New("RemoveExternalHeaders called on TBC instance that is not in external header mode")
+	}
+
+	// We aren't checking error because we want to pass everything from db upstream
+	it, por, err := s.db.BlockHeadersRemove(ctx, headers, tipAfterRemoval, upstreamStateId)
+
+	// Caller of RemoveExternalHeaders wants fork geometry info, parent of removal set, and must handle error upstream
+	return it, por, err
+}
+
+func (s *Server) AddExternalHeaders(ctx context.Context, headers *wire.MsgHeaders, upstreamStateId *[32]byte) (tbcd.InsertType, *tbcd.BlockHeader, *tbcd.BlockHeader, int, error) {
+	if !s.cfg.ExternalHeaderMode {
+		return tbcd.ITInvalid, nil, nil, 0,
+			errors.New("AddExternalHeaders called on TBC instance that is not in external header mode")
+	}
+
+	if len(headers.Headers) == 0 {
+		return tbcd.ITInvalid, nil, nil, 0,
+			errors.New("AddExternalHeaders called with no headers")
+	}
+
+	// Check that chain is contiguous
+	for i := 1; i < len(headers.Headers); i++ {
+		bh := headers.Headers[i].PrevBlock
+		ph := headers.Headers[i-1].BlockHash()
+		if !bh.IsEqual(&ph) {
+			// Chain is not contiguous / linear as this block does not connect to parent
+			return tbcd.ITInvalid, nil, nil, 0,
+				fmt.Errorf("add external headers: header with hash %s at index %d does not connect to "+
+					"previous header with hash %s at index %d",
+					bh.String(), i, ph.String(), i-1)
+		}
+	}
+
+	// We aren't checking error because we want to pass everything from db upstream
+	it, cbh, lbh, n, err := s.db.BlockHeadersInsert(ctx, headers, upstreamStateId)
+
+	// Caller of AddExternalHeaders wants fork geometry change, canonical and last inserted header, and must handle error upstream
+	return it, cbh, lbh, n, err
+}
+
 func (s *Server) handleHeaders(ctx context.Context, p *peer, msg *wire.MsgHeaders) error {
 	log.Tracef("handleHeaders (%v): %v", p, len(msg.Headers))
 	defer log.Tracef("handleHeaders exit (%v): %v", p, len(msg.Headers))
@@ -1364,7 +1458,8 @@ func (s *Server) handleHeaders(ctx context.Context, p *peer, msg *wire.MsgHeader
 		}
 		pbhHash = &msg.Headers[k].PrevBlock
 	}
-	it, cbh, lbh, n, err := s.db.BlockHeadersInsert(ctx, msg)
+	// When running in normal (non-external-header) mode, do not set upstream state IDs
+	it, cbh, lbh, n, err := s.db.BlockHeadersInsert(ctx, msg, nil)
 	if err != nil {
 		// This ends the race between peers during IBD.
 		if errors.Is(err, database.ErrDuplicate) {
@@ -1591,14 +1686,14 @@ func (s *Server) handleNotFound(ctx context.Context, p *peer, msg *wire.MsgNotFo
 	return nil
 }
 
-func (s *Server) insertGenesis(ctx context.Context) error {
+func (s *Server) insertGenesis(ctx context.Context, height uint64, diff *big.Int) error {
 	log.Tracef("insertGenesis")
 	defer log.Tracef("insertGenesis exit")
 
 	// We really should be inserting the block first but block insert
 	// verifies that a block header exists.
 	log.Infof("Inserting genesis block and header: %v", s.chainParams.GenesisHash)
-	err := s.db.BlockHeaderGenesisInsert(ctx, &s.chainParams.GenesisBlock.Header)
+	err := s.db.BlockHeaderGenesisInsert(ctx, &s.chainParams.GenesisBlock.Header, height, diff)
 	if err != nil {
 		return fmt.Errorf("genesis block header insert: %w", err)
 	}
@@ -1755,6 +1850,10 @@ func (s *Server) UtxosByAddress(ctx context.Context, encodedAddress string, star
 	log.Tracef("UtxosByAddress")
 	defer log.Tracef("UtxosByAddress exit")
 
+	if s.cfg.ExternalHeaderMode {
+		return nil, errors.New("cannot call utxos by address on TBC running in External Header mode")
+	}
+
 	addr, err := btcutil.DecodeAddress(encodedAddress, s.chainParams)
 	if err != nil {
 		return nil, err
@@ -1779,11 +1878,47 @@ func (s *Server) UtxosByScriptHash(ctx context.Context, hash tbcd.ScriptHash, st
 	return s.db.UtxosByScriptHash(ctx, hash, start, count)
 }
 
+// ScriptHashAvailableToSpend returns a boolean which indicates whether
+// a specific output (uniquely identified by TxId output index) is
+// available for spending in the UTXO table.
+// This function can return false for two reasons:
+//  1. The outpoint was already spent
+//  2. The outpoint never existed
+func (s *Server) ScriptHashAvailableToSpend(ctx context.Context, txId *chainhash.Hash, index uint32) (bool, error) {
+	log.Tracef("ScriptHashAvailableToSpend")
+	defer log.Tracef("ScriptHashAvailableToSpend exit")
+
+	if s.cfg.ExternalHeaderMode {
+		return false, errors.New("cannot call script hash available to spend on TBC running in External Header mode")
+	}
+
+	txIdBytes := [32]byte(txId.CloneBytes())
+	op := tbcd.NewOutpoint(txIdBytes, index)
+	sh, err := s.db.ScriptHashByOutpoint(ctx, op)
+	if err != nil {
+		return false, err
+	}
+	if sh != nil {
+		// Found it, therefore is unspent
+		return true, nil
+	}
+	// Did not find it, therefore either spent or never existed
+	return false, nil
+}
+
 func (s *Server) SpentOutputsByTxId(ctx context.Context, txId *chainhash.Hash) ([]tbcd.SpentInfo, error) {
 	log.Tracef("SpentOutputsByTxId")
 	defer log.Tracef("SpentOutputsByTxId exit")
 
 	// As it is written now it returns all spent outputs per the tx index view.
+	if s.cfg.ExternalHeaderMode {
+		return nil, errors.New("cannot call spent outputs by txid on TBC running in External Header mode")
+	}
+
+	// XXX investigate if this is indeed correct. As it is written now it
+	// returns all spent outputs. The db should always be canonical but
+	// assert that.
+
 	si, err := s.db.SpentOutputsByTxId(ctx, txId)
 	if err != nil {
 		return nil, err
@@ -1810,6 +1945,10 @@ func (s *Server) BlockHashByTxId(ctx context.Context, txId *chainhash.Hash) (*ch
 func (s *Server) TxById(ctx context.Context, txId *chainhash.Hash) (*wire.MsgTx, error) {
 	log.Tracef("TxById")
 	defer log.Tracef("TxById exit")
+
+	if s.cfg.ExternalHeaderMode {
+		return nil, errors.New("cannot call tx by id on TBC running in External Header mode")
+	}
 
 	blockHash, err := s.db.BlockHashByTxId(ctx, txId)
 	if err != nil {
@@ -1852,6 +1991,10 @@ func (s *Server) FeesAtHeight(ctx context.Context, height, count int64) (uint64,
 	log.Tracef("FeesAtHeight")
 	defer log.Tracef("FeesAtHeight exit")
 
+	if s.cfg.ExternalHeaderMode {
+		return 0, errors.New("cannot call fees at height on TBC running in External Header mode")
+	}
+
 	if height-count < 0 {
 		return 0, errors.New("height - count is less than 0")
 	}
@@ -1879,6 +2022,46 @@ func (s *Server) FeesAtHeight(ctx context.Context, height, count int64) (uint64,
 	}
 
 	return fees, errors.New("not yet")
+}
+
+// FullBlockAvailable returns whether TBC has the full block
+// corresponding to the specified hash available in its database.
+// XXX: Optimize this to not actually read the full block from disk
+func (s *Server) FullBlockAvailable(ctx context.Context, hash *chainhash.Hash) (bool, error) {
+	if s.cfg.ExternalHeaderMode {
+		return false, errors.New("cannot call full block available on TBC running in External Header mode")
+	}
+
+	block, err := s.db.BlockByHash(ctx, hash)
+	if err != nil {
+		if errors.Is(err, database.ErrNotFound) {
+			return false, nil // Not found
+		} else {
+			return false, err
+		}
+	}
+	if block != nil {
+		return true, nil
+	} else {
+		return false, errors.New("fetching block did not return error but block is nil")
+	}
+}
+
+// UpstreamStateId fetches the last-stored upstream state id.
+// If the last header insertion/removal did not specify an upstream
+// state ID, this will return the default upstream state id.
+func (s *Server) UpstreamStateId(ctx context.Context) (*[32]byte, error) {
+	log.Tracef("UpstreamStateId")
+	defer log.Tracef("UpstreamStateId exit")
+
+	return s.db.UpstreamStateId(ctx)
+}
+
+func (s *Server) SetUpstreamStateId(ctx context.Context, upstreamStateId *[32]byte) error {
+	log.Tracef("SetUpstreamStateId")
+	defer log.Tracef("SetUpstreamStateId exit")
+
+	return s.db.SetUpstreamStateId(ctx, upstreamStateId)
 }
 
 type SyncInfo struct {
@@ -1944,6 +2127,10 @@ func (s *Server) Synced(ctx context.Context) SyncInfo {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
+	if s.cfg.ExternalHeaderMode {
+		// XXX Do something, change this method to return *SyncInfo so we can return nil?
+	}
+
 	return s.synced(ctx)
 }
 
@@ -1989,6 +2176,10 @@ func (s *Server) Run(pctx context.Context) error {
 	log.Tracef("Run")
 	defer log.Tracef("Run exit")
 
+	if s.cfg.ExternalHeaderMode {
+		return errors.New("run called but external header mode is enabled")
+	}
+
 	if !s.testAndSetRunning(true) {
 		return errors.New("tbc already running")
 	}
@@ -2029,7 +2220,10 @@ func (s *Server) Run(pctx context.Context) error {
 			return fmt.Errorf("block header best: %w", err)
 		}
 
-		if err = s.insertGenesis(ctx); err != nil {
+		// This Run function is only called in regular (not external header) mode, so this is true genesis block @ 0
+		// and we pass in a nil difficulty so it calculates the starting difficulty as the genesis block's own local
+		// difficulty.
+		if err = s.insertGenesis(ctx, 0, nil); err != nil {
 			return fmt.Errorf("insert genesis: %w", err)
 		}
 		bhb, err = s.db.BlockHeaderBest(ctx)
@@ -2143,4 +2337,76 @@ func (s *Server) Run(pctx context.Context) error {
 	log.Infof("tbc service clean shutdown")
 
 	return err
+}
+
+func (s *Server) ExternalHeaderSetup(ctx context.Context) error {
+	log.Tracef("ExternalHeaderSetup")
+	defer log.Tracef("ExternalHeaderSetup exit")
+
+	if !s.cfg.ExternalHeaderMode {
+		return errors.New("ExternalHeaderSetup called but external header mode is not enabled in config")
+	}
+
+	err := s.DBOpen(ctx)
+	if err != nil {
+		return fmt.Errorf("open level database: %w", err)
+	}
+
+	genesis := s.cfg.EffectiveGenesisBlock
+	genesisHeight := s.cfg.GenesisHeightOffset
+	genesisDiff := &s.cfg.GenesisDifficultyOffset
+
+	if genesis == nil {
+		genesis = &s.chainParams.GenesisBlock.Header
+		genesisHeight = 0
+		genesisDiff = nil
+	}
+
+	// Check
+	bhb, err := s.db.BlockHeaderBest(ctx)
+	if err != nil {
+		if !errors.Is(err, database.ErrNotFound) {
+			return fmt.Errorf("block headers best: %w", err)
+		}
+
+		err := s.db.BlockHeaderGenesisInsert(ctx, &s.chainParams.GenesisBlock.Header, genesisHeight, genesisDiff)
+		if err != nil {
+			return fmt.Errorf("genesis block header insert: %w", err)
+		}
+
+		bhb, err = s.db.BlockHeaderBest(ctx)
+		if err != nil {
+			return err
+		}
+	} else { // No error getting best header, no genesis insert, so check db genesis matches
+		gb, err := s.db.BlockHeadersByHeight(ctx, s.cfg.GenesisHeightOffset)
+		if err != nil {
+			return fmt.Errorf("error getting genesis block from db, %w", err)
+		}
+
+		if len(gb) > 1 {
+			return fmt.Errorf("invalid state, have %d genesis blocks", len(gb))
+		}
+
+		gh := genesis.BlockHash()
+		if !bytes.Equal(gb[0].Hash[:], gh[:]) {
+			return fmt.Errorf("genesis block hash mismatch, db has %x but genesis should be %x", gb[0].Hash, gh)
+		}
+	}
+
+	log.Infof("TBC set up in External Header Mode, genesis=%x, tip=%x", genesis.BlockHash(), bhb.Hash)
+	return nil
+}
+
+func (s *Server) ExternalHeaderTearDown() error {
+	log.Tracef("ExternalHeaderTearDown")
+	defer log.Tracef("ExternalHeaderTearDown exit")
+
+	err := s.DBClose()
+	if err != nil {
+		log.Errorf("db close: %v", err)
+		return err
+	}
+
+	return nil
 }
