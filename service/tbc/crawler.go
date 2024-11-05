@@ -1370,6 +1370,7 @@ func (s *Server) syncIndexersToBest(ctx context.Context) error {
 			Height: 0,
 		}
 	}
+
 	utxoBH, err := s.db.BlockHeaderByHash(ctx, &utxoHH.Hash)
 	if err != nil {
 		return err
