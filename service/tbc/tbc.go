@@ -775,6 +775,12 @@ func (s *Server) downloadBlock(ctx context.Context, p *peer, ch *chainhash.Hash)
 	return err
 }
 
+func (s *Server) DownloadBlockFromRandomPeers(ctx context.Context, block *chainhash.Hash, peersToTry int) {
+	for i := 0; i < peersToTry; i++ {
+		s.downloadBlockFromRandomPeer(ctx, block)
+	}
+}
+
 func (s *Server) downloadBlockFromRandomPeer(ctx context.Context, block *chainhash.Hash) error {
 	log.Tracef("downloadBlockFromRandomPeer")
 	defer log.Tracef("downloadBlockFromRandomPeer exit")
