@@ -1854,7 +1854,7 @@ func (s *Server) FullBlockAvailable(ctx context.Context, hash *chainhash.Hash) (
 	}
 	block, err := s.db.BlockByHash(ctx, hash)
 	if err != nil {
-		if errors.Is(err, database.ErrNotFound) {
+		if errors.Is(err, database.ErrBlockNotFound) {
 			return false, nil // Not found
 		} else {
 			return false, err
